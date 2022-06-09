@@ -9,7 +9,7 @@
                 "aws:ViaAWSService": "false"
             },
             "NotIpAddress": {
-                "aws:SourceIp": "131.226.37.117"
+                "aws:SourceIp": "<VPN IP>"
             }
         }
     }
