@@ -1,0 +1,172 @@
+import boto3
+import json
+import logging
+import os
+
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+client = boto3.client('sts')
+AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+BRAND = "<account/brand name>"
+SLACK_URL = "<slack webhook>"
+SLACK_CHANNEL = "<slack channel name>"
+CPU_UTILIZATION="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-cpu-utilization-alarm"
+STATUS_CHECK_FAILED_INSTANCE="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-statusCheckFailed_instance-alarm"
+STATUS_CHECK_FAILED_SYSTEM="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-statusCheckFailed_system-alarm"
+DISK_SPACE_USED="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-disk_used_percent-alarm"
+MEMORY_USED="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-mem_used_percent-alarm"
+TOTAL_PROCESSES="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-processes_total-alarm"
+PHP_FPM="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-procstat_lookup_pid_count-php-fpm-Alarm"
+NGINX="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-procstat_lookup_pid_count-nginx-alarm"
+
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    logger.info("Event: " + str(event))
+    message = json.loads(event["Records"][0]["Sns"]["Message"])
+    subject = "EC2 Instance Tag Changed"
+
+    items = message["resources"]
+    resources = items[0].split("/", 1)
+    instanceId = str(resources[1])
+
+    ec2 = boto3.resource('ec2')
+    instance = ec2.Instance(instanceId)
+    imageId = instance.image_id
+    instanceType = instance.instance_type
+
+    securityGroupNames = sgNames(instance.security_groups)
+    subnetId = instance.subnet_id
+    availabilityZone = ec2.Subnet(subnetId).availability_zone
+
+    formattedTags = formatTags(instance.tags)
+    instanceName = getInstanceName(instance.tags)
+
+    sendSlackMessage(subject, instanceId, instanceName, instanceType, securityGroupNames, availabilityZone)
+
+    # Access to AWS Lambda
+    client = boto3.client('lambda')
+
+    # Set parameters for lambda's to receive
+    inputParams = {
+        "instanceId"    : instanceId,
+        "instanceType"  : instanceType,
+        "imageId"       : imageId,
+        "tags"          : formattedTags,
+        "name"          : instanceName
+    }
+
+    # Invoke Lambdas below this line
+    # ---------------------------------
+
+    # CPU Ultilization
+    logger.info("Invoke CPU Ultilization lambda.")
+    client.invoke(
+        FunctionName = CPU_UTILIZATION,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # Status Check Failed Instance
+    logger.info("Invoke Status Check Failed Instance lambda.")
+    client.invoke(
+        FunctionName = STATUS_CHECK_FAILED_INSTANCE,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # Status Check Failed System
+    logger.info("Invoke Status Check Failed System lambda.")
+    client.invoke(
+        FunctionName = STATUS_CHECK_FAILED_SYSTEM,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # Disk Space Used
+    logger.info("Invoke Disk Used Percent lambda.")
+    client.invoke(
+        FunctionName = DISK_SPACE_USED,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # Memory Used
+    logger.info("Invoke Memory Used Percent lambda.")
+    client.invoke(
+        FunctionName = MEMORY_USED,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # Total Processes
+    logger.info("Invoke Total Processes lambda.")
+    client.invoke(
+        FunctionName = TOTAL_PROCESSES,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # PHP-FPM
+    client.invoke(
+        FunctionName = PHP_FPM,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+    # Nginx
+    client.invoke(
+        FunctionName = NGINX,
+        InvocationType = 'RequestResponse',
+        Payload = json.dumps(inputParams)
+    )
+
+def sendSlackMessage(subject, instanceId, instanceName, instanceType, securityGroups, availabilityZone) :
+    # Format Slack Message
+    slack_message = {
+        'channel': SLACK_CHANNEL,
+        'text': ":desktop_computer: %s - %s \n :desktop_computer: %s - %s - %s \n :desktop_computer: Security Groups: %s \n :desktop_computer: Region: %s \n " % (BRAND, subject, instanceName, instanceId, instanceType, securityGroups, availabilityZone)
+    }
+
+    # Send Slack Message
+    req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+    try:
+        response = urlopen(req)
+        response.read()
+        logger.info("Message posted to %s", slack_message['channel'])
+    except HTTPError as e:
+        logger.error("Request failed: %d %s", e.code, e.reason)
+    except URLError as e:
+        logger.error("Server connection failed: %s", e.reason)
+
+def formatTags(tags) :
+    formattedTags = {}
+    logger.info(tags)
+    for tag in tags :
+        formattedTags.update( { tag["Key"]: tag["Value"] } )
+    return formattedTags
+
+def getInstanceName(tags) :
+    name = " - "
+    logger.info(tags)
+    for tag in tags :
+        if tag["Key"] == "Name" :
+            name = tag["Value"]
+    logger.info(name)
+    return name
+
+def sgNames(groups) :
+    logger.info(groups)
+    names = ""
+    first = True
+    for group in groups :
+        if first :
+            names = group["GroupName"]
+            first = False
+        else :
+            names = names + ", " + group["GroupName"]
+    return names
