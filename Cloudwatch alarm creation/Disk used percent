@@ -25,7 +25,7 @@ BRAND = "<brand/account name>"
 METRIC_NAME = "disk_used_percent"
 METRIC_DESCRIPTION = "Hard disk space has reached threshold"
 SLACK_URL = "<slack webhook>"
-SLACK_CHANNEL = "aws_notifications"
+SLACK_CHANNEL = "<slack channel name>"
 OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
 ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
 
