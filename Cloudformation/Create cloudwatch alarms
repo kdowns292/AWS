@@ -1,0 +1,2092 @@
+Description:  This template creates SNS topics for EC2 CloudWatch InAlarm and CloudWatch OK.
+
+Parameters:
+  Brand:
+    Description: Specify a brand name for Slack to use in notifications.
+    Type: String
+    Default: My Brand Name
+
+  SlackHookUrl:
+    Description: Specify the Slack Hook URL for notifications.
+    Type: String
+    Default: https://hooks.slack.com/services/
+
+Resources:
+  CloudWatchEc2InAlarm:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "CloudWatch EC2 InAlarm"
+      TopicName: "CloudWatch-Ec2-InAlarm"
+
+  CloudWatchEc2OK:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "CloudWatch EC2 OK"
+      TopicName: "CloudWatch-Ec2-OK"
+
+  Ec2InstanceTagChanged:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "EC2 Instance Tag Changed"
+      TopicName: "Ec2-Instance-Tag-Changed"
+
+  Ec2InstanceTagChangedAccessPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Sid: "__default_statement_ID"
+            Principal:
+              AWS: "*"
+            Action:  [
+                "SNS:GetTopicAttributes",
+                "SNS:SetTopicAttributes",
+                "SNS:AddPermission",
+                "SNS:RemovePermission",
+                "SNS:DeleteTopic",
+                "SNS:Subscribe",
+                "SNS:ListSubscriptionsByTopic",
+                "SNS:Publish",
+                "SNS:Receive"
+              ]
+            Resource: !Ref Ec2InstanceTagChanged
+            Condition:
+              StringEquals:
+                  'AWS:SourceOwner': !Ref AWS::AccountId
+          - Effect: Allow
+            Sid: !Sub
+              - AWSEvents_ec2-instance-tag-changed-${Region}-${AccountId}
+              - { Region: !Ref AWS::Region, AccountId: !Ref AWS::AccountId }
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: "sns:Publish"
+            Resource: !Ref Ec2InstanceTagChanged
+      Topics:
+        - !Ref Ec2InstanceTagChanged
+
+  SubscribeToCloudWatchEc2InAlarm:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt SlackEc2InAlarmNotification.Arn
+      Protocol: lambda
+      TopicArn: !Ref CloudWatchEc2InAlarm
+
+  SubscribeToCloudWatchEc2Ok:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt SlackEc2OkNotification.Arn
+      Protocol: lambda
+      TopicArn: !Ref CloudWatchEc2OK
+
+  SubscribeToEc2InstanceTagChanged:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt Ec2TagHasChanged.Arn
+      Protocol: lambda
+      TopicArn: !Ref Ec2InstanceTagChanged
+
+  Ec2TagChangedTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Ec2TagHasChanged.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Ref Ec2InstanceTagChanged
+
+  SlackEc2OkTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SlackEc2OkNotification.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Ref CloudWatchEc2OK
+
+  SlackEc2AlarmTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SlackEc2InAlarmNotification.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Ref CloudWatchEc2InAlarm
+
+  EventRuleEc2InstanceTagChanged:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: An Ec2 instance tag has changed.
+      Name: ec2-instance-tag-changed
+      EventPattern: !Sub |
+        {
+          "source": [
+            "aws.tag"
+          ],
+          "detail-type": [
+            "Tag Change on Resource"
+          ],
+          "detail": {
+            "service": [
+              "ec2"
+            ],
+            "resource-type": [
+              "instance"
+            ]
+          }
+        }
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Ref Ec2InstanceTagChanged
+          Id: "Ec2InstanceTagChangedV1"
+
+  LambdaRoleEc2:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+      Path: "/"
+      RoleName: "lambda-role-ec2"
+
+  SlackEc2InAlarmNotification:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: slack-ec2-in-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from base64 import b64decode
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          # The base-64 encoded, encrypted key (CiphertextBlob) stored in the kmsEncryptedHookUrl environment variable
+          HOOK_URL = "${SlackHookUrl}"
+          # The Slack channel to send a message to stored in the slackChannel environment variable
+          SLACK_CHANNEL = "system_alerts"
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Event: " + str(event))
+              brand = "${Brand}"
+              message = json.loads(event["Records"][0]["Sns"]["Message"])
+              alarmName = message["AlarmName"]
+              description = message["AlarmDescription"]
+              #newStateReason = message["NewStateReason"]
+              region = message["Region"]
+              instanceId = getInstanceId(message["Trigger"]["Dimensions"])
+
+              if instanceId != None :
+                  ec2 = boto3.resource('ec2')
+                  instance = ec2.Instance(instanceId)
+                  instanceName = getInstanceName(instance.tags)
+              else :
+                  instanceName = ""
+                  instanceId = ""
+
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":red_circle: %s - %s \n :red_circle: Alarm: %s \n :red_circle: %s \n :red_circle: %s \n :red_circle: %s \n" % (brand, instanceName, alarmName, description,instanceId, region)
+              }
+
+              req = Request(HOOK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getInstanceId(dimensions) :
+              id = None
+              logger.info(dimensions)
+              for dimension in dimensions :
+                  if dimension["name"] == "InstanceId" :
+                      id = dimension["value"]
+              return id
+
+          def getInstanceName(tags) :
+              name = None
+              logger.info(tags)
+              for tag in tags :
+                  if tag["Key"] == "Name" :
+                      name = tag["Value"]
+              logger.info(name)
+              return name
+      Description: Send Ec2 InAlarm notification to Slack
+      TracingConfig:
+        Mode: Active
+
+  SlackEc2OkNotification:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: slack-ec2-ok
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from base64 import b64decode
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          # The base-64 encoded, encrypted key (CiphertextBlob) stored in the kmsEncryptedHookUrl environment variable
+          HOOK_URL = "${SlackHookUrl}"
+          # The Slack channel to send a message to stored in the slackChannel environment variable
+          SLACK_CHANNEL = "system_alerts"
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Event: " + str(event))
+              brand = "${Brand}"
+              message = json.loads(event["Records"][0]["Sns"]["Message"])
+              alarmName = message["AlarmName"]
+              description = message["AlarmDescription"]
+              #newStateReason = message["NewStateReason"]
+              region = message["Region"]
+              instanceId = getInstanceId(message["Trigger"]["Dimensions"])
+
+              if instanceId != None :
+                  ec2 = boto3.resource('ec2')
+                  instance = ec2.Instance(instanceId)
+                  instanceName = getInstanceName(instance.tags)
+              else :
+                  instanceName = ""
+                  instanceId = ""
+
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":large_green_circle: %s - %s \n :large_green_circle: Alarm: %s \n :large_green_circle: %s \n :large_green_circle: %s \n :large_green_circle: %s \n" % (brand, instanceName, alarmName, description,instanceId, region)
+              }
+
+              req = Request(HOOK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getInstanceId(dimensions) :
+              id = None
+              logger.info(dimensions)
+              for dimension in dimensions :
+                  if dimension["name"] == "InstanceId" :
+                      id = dimension["value"]
+              return id
+
+          def getInstanceName(tags) :
+              name = None
+              logger.info(tags)
+              for tag in tags :
+                  if tag["Key"] == "Name" :
+                      name = tag["Value"]
+              logger.info(name)
+              return name
+      Description: Send Ec2 OK notification to Slack
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchStatusCheckFailedInstanceAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-statusCheckFailed_instance-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "StatusCheckFailed_Instance"
+          METRIC_DESCRIPTION = "Operating System Failure"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == METRIC_NAME]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialInstance in hasMetric:
+                  for i in range(len(potentialInstance["Dimensions"])):
+                      if potentialInstance["Dimensions"][i]["Value"] == instanceId :
+                          alarmFound = potentialInstance
+
+              # Check if Alarm already exists for this instance
+              if alarmFound :
+                  #check it alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName=METRIC_NAME,
+                  Namespace='AWS/EC2',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION,
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s  - %s \n :heavy_check_mark: %s %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch StatusCheckFailed_Instance Alarm
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchDiskUsedPercentAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-disk_used_percent-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "disk_used_percent"
+          METRIC_DESCRIPTION = "Hard disk space has reached threshold"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == METRIC_NAME]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialInstance in hasMetric:
+                  for i in range(len(potentialInstance["Dimensions"])):
+                      if potentialInstance["Dimensions"][i]["Value"] == instanceId :
+                          alarmFound = potentialInstance
+
+              # Check if Alarm already exists for this instance
+              if alarmFound :
+                  #check it alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName=METRIC_NAME,
+                  Namespace='CWAgent',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION + " of " + str(alarmThreshold) + "%",
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                      {
+                          'Name': 'path',
+                          'Value': '/'
+                      },
+                      {
+                          'Name': 'fstype',
+                          'Value': 'xfs'
+                      },
+                      {
+                          'Name': 'device',
+                          'Value': 'xvda1'
+                      },
+                      {
+                          'Name': 'ImageId',
+                          'Value': imageId
+                      },
+                      {
+                          'Name': 'InstanceType',
+                          'Value': instanceType
+                      }
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s of %s%% - %s \n :heavy_check_mark: %s %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, threshold, status,instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch disk_used_percent Alarm
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchMemUsedPercentAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-mem_used_percent-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "mem_used_percent"
+          METRIC_DESCRIPTION = "System Memory is above our threshold"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == METRIC_NAME]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialInstance in hasMetric:
+                  for i in range(len(potentialInstance["Dimensions"])):
+                      if potentialInstance["Dimensions"][i]["Value"] == instanceId :
+                          alarmFound = potentialInstance
+
+              # Check if Alarm already exists for this instance
+              if alarmFound :
+                  #check it alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName=METRIC_NAME,
+                  Namespace='CWAgent',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION + " of " + str(alarmThreshold) + "%",
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                      {
+                          'Name': 'ImageId',
+                          'Value': imageId
+                      },
+                      {
+                          'Name': 'InstanceType',
+                          'Value': instanceType
+                      }
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s of %s%% - %s \n :heavy_check_mark: %s %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, threshold, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch mem_used_percent Alarm
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchProcstatLookupPidCountNginxAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-procstat_lookup_pid_count-nginx-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "procstat_lookup_pid_count_nginx"
+          METRIC_DESCRIPTION = "Nginx is above threshold"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == "procstat_lookup_pid_count"]
+
+              # Find specific instance with this metric
+
+              alarmFound = ""
+
+              for potentialAlarm in hasMetric:
+                  instanceIdMatch = False
+                  exeMatch = False
+                  for i in range(len(potentialAlarm["Dimensions"])):
+                      if potentialAlarm["Dimensions"][i]["Value"] == instanceId :
+                          instanceIdMatch = True
+                      if potentialAlarm["Dimensions"][i]["Value"] == "nginx" :
+                          exeMatch = True
+                      if instanceIdMatch is True and exeMatch is True :
+                          alarmFound = potentialAlarm
+
+              # Check if Alarm already exists for this instance
+              if len(alarmFound) > 0 :
+                  #check if alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm....")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm....")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName="procstat_lookup_pid_count",
+                  Namespace='CWAgent',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION + " of " + str(alarmThreshold),
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                      {
+                          'Name': 'exe',
+                          'Value': 'nginx'
+                      },
+                      {
+                          'Name': 'pid_finder',
+                          'Value': 'native'
+                      },
+
+                      {
+                          'Name': 'ImageId',
+                          'Value': imageId
+                      },
+                      {
+                          'Name': 'InstanceType',
+                          'Value': instanceType
+                      }
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s of %s - %s \n :heavy_check_mark: %s  %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, threshold, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch procstat_lookup_pid_count Nginx Alarm
+      TracingConfig:
+        Mode: Active
+
+  SlackRootUserLogin:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: slack-root-user-login
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import logging
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "system_alerts"
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Event: " + str(event))
+              brand = "*${Brand}*"
+
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":red_circle: %s - Root user activity has been detected in AWS \n" % (brand)
+              }
+
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+      Description: Send Root user login notification to Slack
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchCPUUtilizationAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-cpu-utilization-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "CPUUtilization"
+          METRIC_DESCRIPTION = "CPU Utilization is above threshold"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == METRIC_NAME]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialInstance in hasMetric:
+                  for i in range(len(potentialInstance["Dimensions"])):
+                      if potentialInstance["Dimensions"][i]["Value"] == instanceId :
+                          alarmFound = potentialInstance
+
+              # Check if Alarm already exists for this instance
+              if alarmFound :
+                  #check it alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName=METRIC_NAME,
+                  Namespace='AWS/EC2',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION + " of " + str(alarmThreshold) + "%",
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s of %s%% - %s \n :heavy_check_mark: %s  %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, threshold, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch CPUUtilization Alarm
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchProcessesTotalAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-processes_total-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "processes_total"
+          METRIC_DESCRIPTION = "Total Processes are above threshold"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == METRIC_NAME]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialInstance in hasMetric:
+                  for i in range(len(potentialInstance["Dimensions"])):
+                      if potentialInstance["Dimensions"][i]["Value"] == instanceId :
+                          alarmFound = potentialInstance
+
+              # Check if Alarm already exists for this instance
+              if alarmFound :
+                  #check it alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName=METRIC_NAME,
+                  Namespace='CWAgent',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION + " of " + str(alarmThreshold),
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                      {
+                          'Name': 'ImageId',
+                          'Value': imageId
+                      },
+                      {
+                          'Name': 'InstanceType',
+                          'Value': instanceType
+                      }
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s of %s - %s \n :heavy_check_mark: %s  %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, threshold, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+      Description: Create CloudWatch processes_total Alarm
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchStatusCheckFailedSystemAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-statusCheckFailed_system-alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "StatusCheckFailed_System"
+          METRIC_DESCRIPTION = "Hardware Failure"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == METRIC_NAME]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialInstance in hasMetric:
+                  for i in range(len(potentialInstance["Dimensions"])):
+                      if potentialInstance["Dimensions"][i]["Value"] == instanceId :
+                          alarmFound = potentialInstance
+
+              # Check if Alarm already exists for this instance
+              if alarmFound :
+                  #check it alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName=METRIC_NAME,
+                  Namespace='AWS/EC2',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION,
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s - %s \n :heavy_check_mark: %s  %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch StatusCheckFailed_System Alarm
+      TracingConfig:
+        Mode: Active
+
+  CreateCloudWatchProcstatLookupPidCountPHPFPMAlarm:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: create-cloudWatch-procstat_lookup_pid_count-php-fpm-Alarm
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          # DO NOT EDIT THIS FILE
+          # It was created by CloudFormation
+          # To make changes, update the CloudFormation Template
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          # HOW THIS FUNCTION WORKS
+          # A Metric Name is defined below as the variable METRIC_NAME
+          # EC2 instance details are passed to this function
+          # If that instance has a tag IDENTICAL to the METRIC_NAME specified
+          # This function will generate the necessary CloudWatch Alarm
+          # And send a slack notification that the alarm was created
+
+          # Variables to Modify for this Alarm
+          BRAND = "${Brand}"
+          METRIC_NAME = "procstat_lookup_pid_count_php_fpm"
+          METRIC_DESCRIPTION = "PHP-FPM is above threshold"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "aws_notifications"
+          OK_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-OK"
+          ALARM_ACTIONS="arn:aws:sns:us-east-1:" + AWS_ACCOUNT_ID + ":CloudWatch-Ec2-InAlarm"
+
+          # You should NOT have to change anything below this line
+          # -------------------------------------------------------
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create CloudWatch client
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+
+              instanceId = event["instanceId"]
+              tags = event["tags"]
+              imageId = event["imageId"]
+              instanceType = event["instanceType"]
+              instanceName = event["name"]
+
+              # Set Environment Variable
+              environment = getEnvironment(tags)
+              logger.info("Env: " + environment)
+
+              # Set Theshold Variable
+              alarmThreshold = getThreshold(tags)
+
+              if alarmThreshold is None:
+                  logger.info("No threshold set for this alarm. Aborting")
+                  return
+
+              # Generate name for Alarm
+              nameOfAlarm = instanceId + "_" + METRIC_NAME
+
+              # Get all CloudWatch Alarms
+              cloudWatchAlarms = cloudwatch.describe_alarms()
+
+              # Filter for alarms that have desired metric
+              hasMetric = [x for x in cloudWatchAlarms["MetricAlarms"] if x["MetricName"] == "procstat_lookup_pid_count"]
+
+              # Find specific instance with this metric
+              alarmFound = ""
+              for potentialAlarm in hasMetric:
+                  instanceIdMatch = False
+                  exeMatch = False
+                  for i in range(len(potentialAlarm["Dimensions"])):
+                      if potentialAlarm["Dimensions"][i]["Value"] == instanceId :
+                          instanceIdMatch = True
+                      if potentialAlarm["Dimensions"][i]["Value"] == "php-fpm" :
+                          exeMatch = True
+                      if instanceIdMatch is True and exeMatch is True :
+                          alarmFound = potentialAlarm
+
+              # Check if Alarm already exists for this instance
+              if len(alarmFound) > 0 :
+                  #check if alarm needs to be updated
+                  needsUpdate = doesAlarmNeedUptating(alarmFound, alarmThreshold)
+                  if needsUpdate :
+                      logger.info("Alarm already exists, but needs to be updated.")
+                      logger.info("Updating Alarm...")
+                      createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                      sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Updated")
+                  else :
+                      logger.info("Aborting - Alarm already exists.")
+                      return
+              else :
+                  logger.info("Creating Alarm...")
+                  createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType)
+                  sendSlackMessage(environment, instanceId, instanceName, alarmThreshold, "Created")
+
+          def createOrUpdateAlarm(nameOfAlarm, alarmThreshold, instanceId, imageId, instanceType) :
+              # Create or Update alarm
+              # put_metric_alarm does both create and update functions
+              cloudwatch.put_metric_alarm(
+                  AlarmName= nameOfAlarm,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=1,
+                  MetricName="procstat_lookup_pid_count",
+                  Namespace='CWAgent',
+                  Period=300,
+                  Statistic='Average',
+                  Threshold=int(alarmThreshold),
+                  ActionsEnabled=True,
+                  OKActions=[
+                      OK_ACTIONS,
+                  ],
+                  AlarmActions=[
+                      ALARM_ACTIONS,
+                  ],
+                  AlarmDescription=METRIC_DESCRIPTION + " of " + str(alarmThreshold),
+                  Dimensions=[
+                      {
+                        'Name': 'InstanceId',
+                        'Value': instanceId
+                      },
+                      {
+                          'Name': 'exe',
+                          'Value': 'php-fpm'
+                      },
+                      {
+                          'Name': 'pid_finder',
+                          'Value': 'native'
+                      },
+                      {
+                          'Name': 'ImageId',
+                          'Value': imageId
+                      },
+                      {
+                          'Name': 'InstanceType',
+                          'Value': instanceType
+                      }
+                  ]
+              )
+
+          def sendSlackMessage(environment, instanceId, instanceName, threshold, status) :
+              # Format Slack message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":heavy_check_mark: %s - %s  \n :heavy_check_mark: CloudWatch Alarm - %s of %s - %s \n :heavy_check_mark:  %s  \n" % (BRAND, environment, METRIC_DESCRIPTION, threshold, status, instanceName, instanceId)
+              }
+
+              # Send Slack Message
+              logger.info("Sending Slack Notification")
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def getEnvironment(tags) :
+              environment = ""
+              for i in range(len(tags)) :
+                  if 'Environment' in tags :
+                      environment = tags['Environment']
+                  elif 'environment' in tags :
+                      environment = tags['environment']
+                  elif 'env' in tags :
+                      environment = tags['env']
+              return environment
+
+          def getThreshold(tags) :
+              for i in range(len(tags)) :
+                  if METRIC_NAME in tags :
+                      threshold = tags[METRIC_NAME]
+                  else :
+                      threshold = None
+              return threshold
+
+          def doesAlarmNeedUptating(alarmFound, alarmThreshold) :
+              #returns true or false
+              logger.info("alarmFound: " + "{:.2f}".format(float(alarmFound["Threshold"])))
+              logger.info("alarmThreshold: " + "{:.2f}".format(float(alarmThreshold)))
+              if "{:.2f}".format(float(alarmFound["Threshold"])) == "{:.2f}".format(float(alarmThreshold)) :
+                  logger.info("Does Alarm need Updating: False")
+                  return False
+              logger.info("Does Alarm need Updating: True")
+              return True
+
+      Description: Create CloudWatch procstat_lookup_pid_count PHP-FPM Alarm
+      TracingConfig:
+        Mode: Active
+
+  Ec2TagHasChanged:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaRoleEc2.Arn
+      FunctionName: ec2-tag-has-changed
+      Handler: index.lambda_handler
+      Timeout: 15
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+
+          client = boto3.client('sts')
+          AWS_ACCOUNT_ID = client.get_caller_identity()['Account']
+
+          BRAND = "${Brand}"
+          SLACK_URL = "${SlackHookUrl}"
+          SLACK_CHANNEL = "system_alerts"
+          CPU_UTILIZATION="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-cpu-utilization-alarm"
+          STATUS_CHECK_FAILED_INSTANCE="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-statusCheckFailed_instance-alarm"
+          STATUS_CHECK_FAILED_SYSTEM="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-statusCheckFailed_system-alarm"
+          DISK_SPACE_USED="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-disk_used_percent-alarm"
+          MEMORY_USED="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-mem_used_percent-alarm"
+          TOTAL_PROCESSES="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-processes_total-alarm"
+          PHP_FPM="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-procstat_lookup_pid_count-php-fpm-Alarm"
+          NGINX="arn:aws:lambda:us-east-1:" + AWS_ACCOUNT_ID + ":function:create-cloudWatch-procstat_lookup_pid_count-nginx-alarm"
+
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Event: " + str(event))
+              message = json.loads(event["Records"][0]["Sns"]["Message"])
+              subject = "EC2 Instance Tag Changed"
+
+              items = message["resources"]
+              resources = items[0].split("/", 1)
+              instanceId = str(resources[1])
+
+              ec2 = boto3.resource('ec2')
+              instance = ec2.Instance(instanceId)
+              imageId = instance.image_id
+              instanceType = instance.instance_type
+
+              securityGroupNames = sgNames(instance.security_groups)
+              subnetId = instance.subnet_id
+              availabilityZone = ec2.Subnet(subnetId).availability_zone
+
+              formattedTags = formatTags(instance.tags)
+              instanceName = getInstanceName(instance.tags)
+
+              sendSlackMessage(subject, instanceId, instanceName, instanceType, securityGroupNames, availabilityZone)
+
+              # Access to AWS Lambda
+              client = boto3.client('lambda')
+
+              # Set parameters for lambda's to receive
+              inputParams = {
+                  "instanceId"    : instanceId,
+                  "instanceType"  : instanceType,
+                  "imageId"       : imageId,
+                  "tags"          : formattedTags,
+                  "name"          : instanceName
+              }
+
+              # Invoke Lambdas below this line
+              # ---------------------------------
+
+              # CPU Ultilization
+              logger.info("Invoke CPU Ultilization lambda.")
+              client.invoke(
+                  FunctionName = CPU_UTILIZATION,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # Status Check Failed Instance
+              logger.info("Invoke Status Check Failed Instance lambda.")
+              client.invoke(
+                  FunctionName = STATUS_CHECK_FAILED_INSTANCE,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # Status Check Failed System
+              logger.info("Invoke Status Check Failed System lambda.")
+              client.invoke(
+                  FunctionName = STATUS_CHECK_FAILED_SYSTEM,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # Disk Space Used
+              logger.info("Invoke Disk Used Percent lambda.")
+              client.invoke(
+                  FunctionName = DISK_SPACE_USED,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # Memory Used
+              logger.info("Invoke Memory Used Percent lambda.")
+              client.invoke(
+                  FunctionName = MEMORY_USED,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # Total Processes
+              logger.info("Invoke Total Processes lambda.")
+              client.invoke(
+                  FunctionName = TOTAL_PROCESSES,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # PHP-FPM
+              client.invoke(
+                  FunctionName = PHP_FPM,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+              # Nginx
+              client.invoke(
+                  FunctionName = NGINX,
+                  InvocationType = 'RequestResponse',
+                  Payload = json.dumps(inputParams)
+              )
+
+          def sendSlackMessage(subject, instanceId, instanceName, instanceType, securityGroups, availabilityZone) :
+              # Format Slack Message
+              slack_message = {
+                  'channel': SLACK_CHANNEL,
+                  'text': ":desktop_computer: %s - %s \n :desktop_computer: %s - %s - %s \n :desktop_computer: Security Groups: %s \n :desktop_computer: Region: %s \n " % (BRAND, subject, instanceName, instanceId, instanceType, securityGroups, availabilityZone)
+              }
+
+              # Send Slack Message
+              req = Request(SLACK_URL, json.dumps(slack_message).encode('utf-8'))
+              try:
+                  response = urlopen(req)
+                  response.read()
+                  logger.info("Message posted to %s", slack_message['channel'])
+              except HTTPError as e:
+                  logger.error("Request failed: %d %s", e.code, e.reason)
+              except URLError as e:
+                  logger.error("Server connection failed: %s", e.reason)
+
+          def formatTags(tags) :
+              formattedTags = {}
+              logger.info(tags)
+              for tag in tags :
+                  formattedTags.update( { tag["Key"]: tag["Value"] } )
+              return formattedTags
+
+          def getInstanceName(tags) :
+              name = " - "
+              logger.info(tags)
+              for tag in tags :
+                  if tag["Key"] == "Name" :
+                      name = tag["Value"]
+              logger.info(name)
+              return name
+
+          def sgNames(groups) :
+              logger.info(groups)
+              names = ""
+              first = True
+              for group in groups :
+                  if first :
+                      names = group["GroupName"]
+                      first = False
+                  else :
+                      names = names + ", " + group["GroupName"]
+              return names
+      Description: Run a series of scripts when an EC2 tag has changed
+      TracingConfig:
+        Mode: Active
