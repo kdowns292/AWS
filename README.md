@@ -13,3 +13,8 @@ The Slack notification lambda one will require a SNS sunscription to send a noti
 The ec2 in alarm and ec2 ok will also require sns subscritpions
 ec2-tag-has-changed will also need an sns subscription
 ######################
+
+######################
+ AWS/Cloudformation/sftp username and password authentication stack 
+ This cloudformation stack allows you to authenticate users to an sftp server via username and password
+ The stack will create an API Gateway , Lambda function, three IAM Roles, API Logging Role, API Gateway Access Role and Lambda Role for you
