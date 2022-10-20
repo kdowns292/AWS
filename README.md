@@ -18,4 +18,5 @@ ec2-tag-has-changed will also need an sns subscription
  AWS/Cloudformation/sftp username and password authentication stack 
  This cloudformation stack allows you to authenticate users to an sftp server via username and password
  The stack will create an API Gateway , Lambda function, three IAM Roles, API Logging Role, API Gateway Access Role and Lambda Role for you
+ https://cloudsbaba.com/enabling-password-authentication-for-aws-sftp-transfer-family-service-using-aws-secrets-manager/
 ######################
