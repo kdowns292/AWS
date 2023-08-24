@@ -30,3 +30,4 @@ bash network_usage.sh ap-south-1 NetworkOut 2020-06-01T00:00:00.000Z 2020-06-30T
  *Replace ap-south-1 with the Region where your instances are located
  *Specify either NetworkIn or NetworkOut to calculate the traffic flow direction.
  *Replace 2020-06-01T00:00:00.000Z and 2020-06-30T23:59:59.000Z with the start and end timestamps in the range that you want to calculate the network usage for.
+ ######################
