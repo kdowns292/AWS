@@ -1,0 +1,51 @@
+#Ram usage
+"mem": {
+                            	"measurement": [
+                                    	"mem_used_percent"
+                            	],
+                            	"metrics_collection_interval": 60
+ },
+
+
+
+#Disk usage
+"disk": {
+                            	"measurement": [
+                                    	"used_percent"
+                            	],
+                            	"metrics_collection_interval": 60,
+                            	"resources": [
+                                    	"*"
+                            	]
+},
+
+
+#Total processes
+"processes": {
+                            	"measurement": [
+                                    	"total"
+                            	],
+                            	"metrics_collection_interval": 60
+                    	},
+#Monitoring a specific process
+#https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Agent-procstat-process-metrics.html#CloudWatch-view-procstat-metrics 
+
+"procstat": [
+      {
+            "exe": "nginx",
+            "measurement": [
+                    "pid_count"
+            ]
+       },
+       {
+            "exe": "php-fpm",
+            "measurement": [
+                   "pid_count"
+            ]
+      },
+      {
+            "exe": "httpd",
+            "measurement": [
+            "pid_count"
+            ]
+       }
