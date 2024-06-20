@@ -1,0 +1,92 @@
+Install agent to monitor metrics
+Create IAM role to collect cloudwatch agent data
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/create-iam-roles-for-cloudwatch-agent.html 
+Ec2 instances can have only one role attached to it. So if a role is already attached to it then skip to step 2.
+Attach IAM policy CloudWatchAgentServerPolicy to ec2 instance
+Install cloudwatch agent on server
+yum install -y amazon-cloudwatch-agent
+If it says there is no amazon-cloudwatch-agent package available then download the link and install it
+Wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+rpm -U ./amazon-cloudwatch-agent.rpm
+Run the installation wizard
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-config-wizard
+OS - linux
+EC2
+Root user
+StatsD daemon - yes
+Port 8125
+Collect interval - 60s
+Aggregate interval - 60s
+CollectD - no
+Host metrics - yes
+Monitor cpu metrics per core - no
+Add ec2 dimensions - yes
+Collect metrics at high resolution - 60s
+Default metrics config - advanced
+Are you satisfied - yes
+Default config file to import - no
+Monitor any log files - no
+Store config file in SSM parameter store - no
+/opt/aws/amazon-cloudwatch-agent/bin/config.json
+Start the cloudwatch agent
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
+The above config file is where it will be stored if the setup wizard was used
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Agent-on-EC2-Instance-fleet.html#start-CloudWatch-Agent-EC2-fleet 
+Check cloudwatch agent status
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -m ec2 -a status
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Agent-on-EC2-Instance-fleet.html#start-CloudWatch-Agent-EC2-fleet 
+
+
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Agent-Configuration-File-Details.html 
+
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_MetricDatum.html 
+Metric units you can use
+
+Logs for cloudwatch are stored in /opt/aws/amazon-cloudwatch-agent/logs
+
+
+Using cloudwatch metrics to monitor a server
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Agent-Configuration-File-Details.html
+ How to edit configuration file
+
+https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/metrics-collected-by-CloudWatch-agent.html 
+List of metrics
+
+Config file /opt/aws/amazon-cloudwatch-agent/bin/config.json
+The template can be copied and pasted from here CWA_template.json. Below is a breakdown of each thing to monitor.
+Enable the following default metrics for Ec2 instances by going to cloudwatch -> Ec2 -> per instance metrics:
+StatusCheckFailed
+Reports whether the instance has passed both the instance status check and the system status check in the last minute.
+StatusCheckFailed_Instance = OS failure
+StatusCheckFailed_System = Hardware failure
+CPU utilization
+Once all default metrics are set up in cloudwatch you will need to edit /opt/aws/amazon-cloudwatch-agent/bin/config.json to start adding custom metrics.
+*see the json file for the config file*
+
+
+
+Have cloudwatch agent load the latest version of the CloudWatch agent configuration file after you make changes to the config file
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
+  
+https://docs.amazonaws.cn/en_us/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Agent-commandline-fleet.html 
+  
+Setup your dashboard with the metrics you just setup. They will be under cloudwatch -> metrics ->  CWAgent -> 
+  
+Setup alarms for your metrics. Make sure to give a good description for the alarm so we know the brand and server.
+  
+Make sure to select the topic that was created to initiate the lambda function that will notify our slack channel. If no topic was setup or lambda function then one will need to be created
+Setting up Cloudwatch to send notifications to slack
+https://medium.com/analytics-vidhya/generate-slack-notifications-for-aws-cloudwatch-alarms-e46b68540133 
+  
+First we need to create two SNS topics. One for an in “alarm” state and one for an “ok” state. Navigate to the SNS dashboard and select standard for the type. Name it either CloudWatchAlarmOK or CloudWatchInAlarm. Leave everything else as default.
+Next you need to create a lambda function. In order to do this you will need to create a role in IAM. Name it CloudWatchSlackNotification-role and select lambda as the use case.
+Attach AWSLambdaBasicExecutionRole and AmazonSSMFullAccess for the policy
+Now navigate to the lambda dashboard https://console.aws.amazon.com/lambda/home?region=us-east-1#/functions 
+We will need to create two lambda functions so that we get both an “ok” alarm and an in “alarm” state. Name one SlackCloudWatchOK and the other SlackCloudWatchInAlarm.
+Select python as the runtime
+Select the role you created in step 2 under “Change default execution role”. Leave everything else as default
+Select the lambda function you created and add the SNS topic that you just created as a trigger.
+Now select the code tab and copy and paste this lambda function for in “alarm” state https://drive.google.com/file/d/1CQ7rN6e7Kd1qvb6--4ZRx1O9o_sbLzhB/view?usp=sharing
+Copy and paste this for “ok” state https://drive.google.com/file/d/1BKuqFUHqDIwP2BSkju6vD0IV9VkiCYfo/view?usp=sharing
+Change the brand value in the python script to whichever brand you’re configuring for
+Make sure you hit “deploy” to save the changes you’ve made
